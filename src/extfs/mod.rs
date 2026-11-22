@@ -9,7 +9,12 @@ pub const COMPAT_HAS_JOURNAL: u32 = 0x0004;
 pub const INCOMPAT_FILETYPE: u32 = 0x0002;
 pub const INCOMPAT_EXTENTS: u32 = 0x0040;
 pub const INCOMPAT_64BIT: u32 = 0x0080;
+pub const INCOMPAT_FLEX_BG: u32 = 0x0200;
+pub const RO_COMPAT_HUGE_FILE: u32 = 0x0008;
+pub const RO_COMPAT_DIR_NLINK: u32 = 0x0020;
+pub const RO_COMPAT_EXTRA_ISIZE: u32 = 0x0040;
 pub const RO_COMPAT_SPARSE_SUPER2: u32 = 0x0200;
+pub const RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
 
 pub const EXT4_INDEX_FL: u32 = 0x0000_1000;
 pub const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
@@ -414,11 +419,18 @@ impl Volume {
         }
 
         let block_size = sb.block_size();
-        let num_groups = if sb.s_inodes_per_group > 0 {
-            (sb.s_inodes_count / sb.s_inodes_per_group) as usize
+        let ino_groups = if sb.s_inodes_per_group > 0 {
+            sb.s_inodes_count.div_ceil(sb.s_inodes_per_group) as usize
         } else {
             1
         };
+        let blk_groups = if sb.s_blocks_per_group > 0 && sb.s_blocks_count > sb.s_first_data_block as u64 {
+            ((sb.s_blocks_count - sb.s_first_data_block as u64)
+                .div_ceil(sb.s_blocks_per_group as u64)) as usize
+        } else {
+            1
+        };
+        let num_groups = ino_groups.max(blk_groups).max(1);
 
         let gdt_offset = (0x400 / block_size + 1) * block_size;
         let desc_size = sb.s_desc_size as usize;
@@ -450,6 +462,12 @@ impl Volume {
 
     pub fn read_inode(&mut self, inode_idx: u32, mut file_type: u8) -> io::Result<InodeData> {
         let ipg = self.superblock.s_inodes_per_group;
+        if inode_idx == 0 || ipg == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid inode number {} (inodes_per_group={})", inode_idx, ipg),
+            ));
+        }
         let group_idx = ((inode_idx - 1) / ipg) as usize;
         let entry_idx = ((inode_idx - 1) % ipg) as u64;
 
@@ -457,7 +475,17 @@ impl Volume {
             .group_descriptors
             .get(group_idx)
             .map(|g| g.bg_inode_table)
-            .unwrap_or(99);
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Inode {} maps to out-of-range block group {} (groups={})",
+                        inode_idx,
+                        group_idx,
+                        self.group_descriptors.len()
+                    ),
+                )
+            })?;
         let inode_size = self.superblock.s_inode_size as usize;
         let offset = inode_table_block * self.block_size + entry_idx * inode_size as u64;
         let raw = self.reader.read_vec(offset, inode_size)?;
@@ -486,7 +514,7 @@ impl Volume {
 
         let uid_lo = u32_le_u16(&raw, 0x02);
         let gid_lo = u32_le_u16(&raw, 0x18);
-        let (uid_hi, gid_hi, acl_hi, extra_isize) = if inode_size >= 130 {
+        let (uid_hi, gid_hi, acl_hi) = if raw.len() >= 128 {
             let uh = u32_le_u16(&raw, 0x78);
             let gh = u32_le_u16(&raw, 0x7A);
             let ah = if self.superblock.is_64bit() {
@@ -494,10 +522,14 @@ impl Volume {
             } else {
                 0
             };
-            let ei = u16_le(&raw, 0x80);
-            (uh, gh, ah, ei)
+            (uh, gh, ah)
         } else {
-            (0, 0, 0, 0)
+            (0, 0, 0)
+        };
+        let extra_isize = if raw.len() >= 130 {
+            u16_le(&raw, 0x80)
+        } else {
+            0
         };
 
         let mut i_block = [0u32; 15];
@@ -669,10 +701,17 @@ impl Volume {
             return Ok(());
         }
 
-        // Fast symlink or inline data
-        let is_fast_symlink =
-            inode.is_symlink() && (inode.i_flags & EXT4_EXTENTS_FL) == 0 && inode.i_blocks_lo == 0;
-        if is_fast_symlink && size <= 60 {
+        // Fast symlink: inline in i_block when size <= 60 and any allocated blocks belong solely to an external EA block
+        let ea_blocks = if inode.i_file_acl != 0 {
+            (self.block_size / 512) as u32
+        } else {
+            0
+        };
+        let is_fast_symlink = inode.is_symlink()
+            && (inode.i_flags & (EXT4_EXTENTS_FL | EXT4_INLINE_DATA_FL)) == 0
+            && size <= 60
+            && inode.i_blocks_lo <= ea_blocks;
+        if is_fast_symlink {
             writer.write_all(&inode.i_block_raw[..size as usize])?;
             return Ok(());
         }
@@ -854,21 +893,17 @@ impl Volume {
                 break;
             }
 
-            let prefix = match e_name_index {
-                0 => "",
-                1 => "user.",
-                2 => "system.posix_acl_access",
-                3 => "system.posix_acl_default",
-                4 => "trusted.",
-                6 => "security.",
-                7 => "system.",
-                8 => "system.richacl",
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Unknown attribute prefix {}", e_name_index),
-                    ));
-                }
+            let prefix: std::borrow::Cow<'static, str> = match e_name_index {
+                0 => std::borrow::Cow::Borrowed(""),
+                1 => std::borrow::Cow::Borrowed("user."),
+                2 => std::borrow::Cow::Borrowed("system.posix_acl_access"),
+                3 => std::borrow::Cow::Borrowed("system.posix_acl_default"),
+                4 => std::borrow::Cow::Borrowed("trusted."),
+                5 => std::borrow::Cow::Borrowed("lustre."),
+                6 => std::borrow::Cow::Borrowed("security."),
+                7 => std::borrow::Cow::Borrowed("system."),
+                8 => std::borrow::Cow::Borrowed("system.richacl"),
+                other => std::borrow::Cow::Owned(format!("xattr_{}.", other)),
             };
 
             if i + 16 + e_name_len > entries.len() {

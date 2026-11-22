@@ -109,7 +109,7 @@ impl UnpackContext {
     ) -> io::Result<()> {
         let entries = vol.read_dir(dir_inode)?;
         for entry in entries {
-            if entry.name == "." || entry.name == ".." || entry.name.ends_with(" (2)") {
+            if entry.name == "." || entry.name == ".." {
                 continue;
             }
             if self.error_times >= 200 {
@@ -132,7 +132,10 @@ impl UnpackContext {
             let tmp_raw = format!("{}{}", self.partition_name, entry_inode_path);
             let tmp_path = tmp_raw.trim_start_matches('/').to_string();
 
-            let has_space = tmp_path.get(1..).map(|s| s.contains(' ')).unwrap_or(false);
+            let has_space = tmp_path
+                .char_indices()
+                .nth(1)
+                .is_some_and(|(idx, _)| tmp_path[idx..].contains(' '));
             let out_path = if has_space {
                 self.space_paths.push(tmp_path.clone());
                 tmp_path.replace(' ', "_")

@@ -283,3 +283,135 @@ fn test_ext4_sparse_and_xattr_capabilities() {
     let _ = fs::remove_dir_all(&dir);
     let _ = PathBuf::new();
 }
+
+#[test]
+fn test_fast_symlink_with_external_xattr_and_detect_type_256_ext3() {
+    use ext_cli::extfs::Superblock;
+
+    // 1) mke2fs-style 256-byte inode EXT2 & EXT3 (no extents/ext4 features) must NOT detect as EXT4
+    let mut raw_sb = [0u8; 1024];
+    write_u16(&mut raw_sb, 0x38, EXT4_SUPER_MAGIC);
+    write_u32(&mut raw_sb, 0x4C, 1);
+    write_u16(&mut raw_sb, 0x58, 256);
+    write_u32(&mut raw_sb, 0x60, INCOMPAT_FILETYPE);
+    write_u32(&mut raw_sb, 0x5C, COMPAT_HAS_JOURNAL);
+    assert_eq!(detect_type(&Superblock::parse(&raw_sb)).fs_type, "EXT3");
+
+    write_u32(&mut raw_sb, 0x5C, 0);
+    assert_eq!(detect_type(&Superblock::parse(&raw_sb)).fs_type, "EXT2");
+
+    // EXT4 with 128-byte inode + extents
+    write_u16(&mut raw_sb, 0x58, 128);
+    write_u32(&mut raw_sb, 0x60, INCOMPAT_FILETYPE | INCOMPAT_EXTENTS);
+    assert_eq!(detect_type(&Superblock::parse(&raw_sb)).fs_type, "EXT4");
+
+    // 2) Fast symlink with i_file_acl != 0 (i_blocks_lo = bs/512 = 8) + filename ending in " (2)"
+    let bs = 4096usize;
+    let total_blocks = 64u32;
+    let mut img = vec![0u8; total_blocks as usize * bs];
+    let sb = &mut img[1024..2048];
+    write_u32(sb, 0x00, 64);
+    write_u32(sb, 0x04, total_blocks);
+    write_u32(sb, 0x18, 2);
+    write_u32(sb, 0x20, total_blocks);
+    write_u32(sb, 0x28, 64);
+    write_u16(sb, 0x38, EXT4_SUPER_MAGIC);
+    write_u32(sb, 0x4C, 1);
+    write_u16(sb, 0x58, 256);
+    write_u32(sb, 0x60, INCOMPAT_FILETYPE | INCOMPAT_EXTENTS);
+    write_u16(sb, 0xFE, 32);
+
+    write_u32(&mut img[bs..bs + 32], 0x08, 4);
+    let it_off = 4 * bs;
+
+    // Root dir inode (#2) at block 10
+    {
+        let ino2 = &mut img[it_off + 256..it_off + 512];
+        write_u16(ino2, 0x00, S_IFDIR | 0o755);
+        write_u32(ino2, 0x04, bs as u32);
+        write_u32(ino2, 0x20, EXT4_EXTENTS_FL);
+        write_u16(ino2, 0x28, 0xF30A);
+        write_u16(ino2, 0x2A, 1);
+        write_u16(ino2, 0x2C, 3);
+        write_u16(ino2, 0x38, 1);
+        write_u32(ino2, 0x3C, 10);
+    }
+
+    // Fast symlink inode (#11) pointing to "/system/bin/sh", WITH external xattr block 12 (i_blocks_lo = 8)
+    {
+        let ino11 = &mut img[it_off + 10 * 256..it_off + 11 * 256];
+        write_u16(ino11, 0x00, S_IFLNK | 0o777);
+        write_u32(ino11, 0x04, 14);
+        write_u32(ino11, 0x1C, 8); // bs/512 for external xattr block
+        ino11[0x28..0x28 + 14].copy_from_slice(b"/system/bin/sh");
+        write_u32(ino11, 0x68, 12); // i_file_acl_lo = block 12
+    }
+
+    // External xattr block 12 with security.selinux
+    {
+        let xb = &mut img[12 * bs..13 * bs];
+        write_u32(xb, 0, 0xEA02_0000);
+        write_u32(xb, 4, 1);
+        write_u32(xb, 8, 1);
+        let e = 32;
+        xb[e] = 7;
+        xb[e + 1] = 6;
+        write_u16(xb, e + 2, 128);
+        write_u32(xb, e + 8, 22);
+        xb[e + 16..e + 23].copy_from_slice(b"selinux");
+        xb[128..128 + 22].copy_from_slice(b"u:object_r:foo_exec:s0");
+    }
+
+    // Regular file inode (#12) named "app (2).apk"
+    {
+        let ino12 = &mut img[it_off + 11 * 256..it_off + 12 * 256];
+        write_u16(ino12, 0x00, S_IFREG | 0o644);
+        write_u32(ino12, 0x04, 3);
+        write_u32(ino12, 0x20, EXT4_EXTENTS_FL);
+        write_u16(ino12, 0x28, 0xF30A);
+        write_u16(ino12, 0x2A, 1);
+        write_u16(ino12, 0x2C, 3);
+        write_u16(ino12, 0x38, 1);
+        write_u32(ino12, 0x3C, 11);
+    }
+    img[11 * bs..11 * bs + 3].copy_from_slice(b"apk");
+
+    let dir_blk = &mut img[10 * bs..11 * bs];
+    write_u32(dir_blk, 0, 2);
+    write_u16(dir_blk, 4, 12);
+    dir_blk[6] = 1;
+    dir_blk[7] = 2;
+    dir_blk[8] = b'.';
+    write_u32(dir_blk, 12, 2);
+    write_u16(dir_blk, 16, 12);
+    dir_blk[18] = 2;
+    dir_blk[19] = 2;
+    dir_blk[20..22].copy_from_slice(b"..");
+    write_u32(dir_blk, 24, 11);
+    write_u16(dir_blk, 28, 12);
+    dir_blk[30] = 2;
+    dir_blk[31] = 7;
+    dir_blk[32..34].copy_from_slice(b"sh");
+    write_u32(dir_blk, 36, 12);
+    write_u16(dir_blk, 40, (bs - 36) as u16);
+    dir_blk[42] = 11;
+    dir_blk[43] = 1;
+    dir_blk[44..55].copy_from_slice(b"app (2).apk");
+
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("ext_cli_test_regress_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("reg.img");
+    fs::write(&p, &img).unwrap();
+
+    let out_dir = unpack_image(&p).unwrap();
+    assert_eq!(fs::read(out_dir.join("app_(2).apk")).unwrap(), b"apk");
+    let cfg = fs::read_to_string(dir.join("config").join("reg_fs_config")).unwrap();
+    assert!(cfg.contains("reg/sh 0 0 0777 /system/bin/sh"), "got:\n{}", cfg);
+    assert!(cfg.contains("reg/app_(2).apk 0 0 0644"), "got:\n{}", cfg);
+    let fc = fs::read_to_string(dir.join("config").join("reg_file_contexts")).unwrap();
+    assert!(fc.contains("/reg/sh u:object_r:foo_exec:s0"));
+
+    let _ = fs::remove_dir_all(&dir);
+}
