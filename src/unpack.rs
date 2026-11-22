@@ -157,10 +157,15 @@ impl UnpackContext {
                         let regex_str = format!("/{}", escape_regex(&out_path));
                         self.push_file_context(regex_str, &ctx);
                     }
-                } else if xname == "security.capability" && xval.len() >= 16 {
+                } else if xname == "security.capability" && xval.len() >= 12 {
+                    let magic_etc = u32::from_le_bytes([xval[0], xval[1], xval[2], xval[3]]);
+                    let ver = magic_etc & 0xFF00_0000;
                     let cap_lo = u32::from_le_bytes([xval[4], xval[5], xval[6], xval[7]]) as u64;
-                    let cap_hi =
-                        u32::from_le_bytes([xval[12], xval[13], xval[14], xval[15]]) as u64;
+                    let cap_hi = if ver >= 0x0200_0000 && xval.len() >= 16 {
+                        u32::from_le_bytes([xval[12], xval[13], xval[14], xval[15]]) as u64
+                    } else {
+                        0
+                    };
                     let cap_val = (cap_hi << 32) | cap_lo;
                     cap = format!(" capabilities={:#x}", cap_val);
                 }
@@ -283,10 +288,21 @@ pub fn unpack_image(img_path: &Path) -> io::Result<PathBuf> {
 
     ctx.scan_dir(&mut vol, &root_inode, "")?;
 
-    // Header entries for fs_config
-    ctx.fs_config.insert(0, "/ 0 0 0755".to_string());
-    ctx.fs_config
-        .insert(1, format!("{} 0 0 0755", partition_name));
+    // Header entries for fs_config (preserve root inode ownership and permissions)
+    let root_uid = root_inode.i_uid;
+    let root_gid = root_inode.i_gid;
+    let root_mode = root_inode.i_mode & 0o7777;
+    ctx.fs_config.insert(
+        0,
+        format!("/ {} {} {:04o}", root_uid, root_gid, root_mode),
+    );
+    ctx.fs_config.insert(
+        1,
+        format!(
+            "{} {} {} {:04o}",
+            partition_name, root_uid, root_gid, root_mode
+        ),
+    );
     ctx.fs_config
         .insert(2, format!("{}/lost+found 0 0 0700", partition_name));
 

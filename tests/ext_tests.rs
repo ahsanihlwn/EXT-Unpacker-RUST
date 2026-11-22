@@ -415,3 +415,107 @@ fn test_fast_symlink_with_external_xattr_and_detect_type_256_ext3() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_root_inode_ownership_and_cap_revision_1() {
+    let bs = 4096usize;
+    let total_blocks = 64u32;
+    let mut img = vec![0u8; total_blocks as usize * bs];
+
+    let sb = &mut img[1024..2048];
+    write_u32(sb, 0x00, 64);
+    write_u32(sb, 0x04, total_blocks);
+    write_u32(sb, 0x18, 2); // 1024 << 2 = 4096
+    write_u32(sb, 0x20, total_blocks);
+    write_u32(sb, 0x28, 64);
+    write_u16(sb, 0x38, EXT4_SUPER_MAGIC);
+    write_u32(sb, 0x4C, 1);
+    write_u16(sb, 0x58, 256);
+    write_u32(sb, 0x60, INCOMPAT_FILETYPE | INCOMPAT_EXTENTS);
+    write_u16(sb, 0xFE, 32);
+
+    write_u32(&mut img[bs..bs + 32], 0x08, 4);
+    let it_off = 4 * bs;
+
+    // Root inode (#2): custom uid/gid (including high 16-bit halves) and sticky/setgid bits
+    {
+        let ino2 = &mut img[it_off + 256..it_off + 512];
+        write_u16(ino2, 0x00, S_IFDIR | 0o2751);
+        write_u16(ino2, 0x02, 1000); // i_uid_lo
+        write_u32(ino2, 0x04, bs as u32);
+        write_u16(ino2, 0x18, 2000); // i_gid_lo
+        write_u16(ino2, 0x78, 1); // l_i_uid_high -> (1 << 16) + 1000 = 66536
+        write_u16(ino2, 0x7A, 2); // l_i_gid_high -> (2 << 16) + 2000 = 133072
+        write_u32(ino2, 0x20, EXT4_EXTENTS_FL);
+        write_u16(ino2, 0x28, 0xF30A);
+        write_u16(ino2, 0x2A, 1);
+        write_u16(ino2, 0x2C, 3);
+        write_u16(ino2, 0x38, 1);
+        write_u32(ino2, 0x3C, 10);
+    }
+
+    // File inode (#11): inline VFS_CAP_REVISION_1 (12 bytes) security.capability
+    {
+        let ino11 = &mut img[it_off + 10 * 256..it_off + 11 * 256];
+        write_u16(ino11, 0x00, S_IFREG | 0o755);
+        write_u32(ino11, 0x04, 2);
+        write_u32(ino11, 0x20, EXT4_EXTENTS_FL);
+        write_u16(ino11, 0x28, 0xF30A);
+        write_u16(ino11, 0x2A, 1);
+        write_u16(ino11, 0x2C, 3);
+        write_u16(ino11, 0x38, 1);
+        write_u32(ino11, 0x3C, 11);
+        write_u16(ino11, 0x80, 28); // i_extra_isize
+
+        write_u32(ino11, 156, 0xEA02_0000);
+        let e1 = 160;
+        ino11[e1] = 10;
+        ino11[e1 + 1] = 6; // security.
+        write_u16(ino11, e1 + 2, 32); // relative to 160 -> offset 192
+        write_u32(ino11, e1 + 8, 12); // VFS_CAP_REVISION_1 payload size
+        ino11[e1 + 16..e1 + 26].copy_from_slice(b"capability");
+        let cap_off = 160 + 32;
+        write_u32(ino11, cap_off, 0x0100_0001); // VFS_CAP_REVISION_1 | effective
+        write_u32(ino11, cap_off + 4, 1 << 12); // permitted low (CAP_NET_ADMIN)
+        write_u32(ino11, cap_off + 8, 0); // inheritable low
+    }
+
+    img[11 * bs..11 * bs + 2].copy_from_slice(b"ok");
+
+    let dir_blk = &mut img[10 * bs..11 * bs];
+    write_u32(dir_blk, 0, 2);
+    write_u16(dir_blk, 4, 12);
+    dir_blk[6] = 1;
+    dir_blk[7] = 2;
+    dir_blk[8] = b'.';
+    write_u32(dir_blk, 12, 2);
+    write_u16(dir_blk, 16, 12);
+    dir_blk[18] = 2;
+    dir_blk[19] = 2;
+    dir_blk[20..22].copy_from_slice(b"..");
+    write_u32(dir_blk, 24, 11);
+    write_u16(dir_blk, 28, (bs - 24) as u16);
+    dir_blk[30] = 4;
+    dir_blk[31] = 1;
+    dir_blk[32..36].copy_from_slice(b"cap1");
+
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("ext_cli_test_cap1_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("captest.img");
+    fs::write(&p, &img).unwrap();
+
+    let out_dir = unpack_image(&p).unwrap();
+    assert_eq!(fs::read(out_dir.join("cap1")).unwrap(), b"ok");
+    let cfg = fs::read_to_string(dir.join("config").join("captest_fs_config")).unwrap();
+    assert!(cfg.contains("/ 66536 133072 2751\n"), "got:\n{}", cfg);
+    assert!(cfg.contains("captest 66536 133072 2751\n"), "got:\n{}", cfg);
+    assert!(
+        cfg.contains("captest/cap1 0 0 0755 capabilities=0x1000"),
+        "got:\n{}",
+        cfg
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
